@@ -29,6 +29,7 @@ import hmac
 import codecs
 import ctypes
 import json
+import math
 import os
 import queue
 import re
@@ -396,6 +397,7 @@ class StrataEngine:
     (`temperature=F top_p=F top_k=N seed=N`, the engine's own spelling).  An absent temperature keeps the
     engine's default, which is greedy; `temperature=0` means the same thing, so it is not forwarded.
     """
+    close_s = 20.0                     # config engine_close_s: orderly KV commit deadline
     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
@@ -619,6 +621,10 @@ class StrataEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
+        if len(f) >= 21:
+            self.last.update(kv_persist_restored_tokens=int(f[16]), kv_persist_read_bytes=int(f[17]),
+                             kv_persist_restore_ms=float(f[18]), kv_persist_write_bytes=int(f[19]),
+                             kv_persist_commit_ms=float(f[20]))
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -884,6 +890,12 @@ class StrataEngine:
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
         yields, solo_again = 0, 0
+        disk_metrics = {}
+        def record_disk_metrics():
+            for key in ("kv_persist_restored_tokens", "kv_persist_read_bytes", "kv_persist_restore_ms",
+                        "kv_persist_write_bytes", "kv_persist_commit_ms"):
+                if key in self.last:
+                    disk_metrics[key] = disk_metrics.get(key, 0) + self.last[key]
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
@@ -917,6 +929,7 @@ class StrataEngine:
                                     self._send(f"BYIELD {reserved}")
                             yield None
                     phase = "none"                          # its DONE is read
+                    record_disk_metrics()
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
@@ -981,6 +994,7 @@ class StrataEngine:
                                 self._send(f"BYIELD {slot}")
                                 asked = True
                             yield None
+                    record_disk_metrics()
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     phase = "slot" if cont else "none"
                     while pending:
@@ -1053,12 +1067,15 @@ class StrataEngine:
                 if phase == "solo":
                     self._send("STOP")
                     self._drain_control("DONE")
+                    record_disk_metrics()
                 elif phase == "admit":
                     line = self._drain_control("BADM")
+                    record_disk_metrics()
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
             except EngineDied:
                 pass
+            self.last.update(disk_metrics)
             if holding:
                 self.ctl.release()
             if reserved is not None:
@@ -1225,16 +1242,19 @@ class StrataEngine:
 
     def close(self):
         """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
+        a while). The orderly phase uses engine_close_s; terminate and kill each get 20 s.
+        A persistence-enabled engine must exit successfully before unloading reports success."""
         if self.proc is None:
             return
+        persistence_enabled = "--kv-persist" in self.spawn[1]
+        exit_code = None
         try:
             if self.proc.poll() is None:
                 try:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=self.close_s)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
                     self.proc.wait(timeout=20)
@@ -1248,6 +1268,7 @@ class StrataEngine:
             pass
         finally:
             if self.proc.poll() is not None:
+                exit_code = self.proc.returncode
                 if self.pump is not None:
                     self.pump.join(timeout=2)
                 self.proc.stdin.close()
@@ -1257,6 +1278,8 @@ class StrataEngine:
                 self.proc = None
                 self.ended = True
                 self.progress, self.last = None, {}
+        if persistence_enabled and exit_code != 0:
+            raise EngineStuck(f"KV persistence shutdown did not commit successfully (engine exit {exit_code}); inspect the engine log")
 
 
 class Vision:
@@ -1387,6 +1410,15 @@ def gpu_list(cfg: dict) -> list[int]:
         return []
     items = g if isinstance(g, (list, tuple)) else str(g).split(",")
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
+
+
+def engine_close_s(cfg: dict) -> float:
+    """Seconds to allow QUIT to save KV and release the model."""
+    enabled = "--kv-persist" in cfg.get("args", [])
+    value = cfg.get("engine_close_s", 300 if enabled else 20)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError('"engine_close_s" must be positive seconds')
+    return float(value)
 
 
 def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
@@ -2493,6 +2525,8 @@ class Service:
                                 "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
                                 "engine_generated": last.get("generated"),
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+                                **{k: last.get(k) for k in ("kv_persist_restored_tokens", "kv_persist_read_bytes",
+                                    "kv_persist_restore_ms", "kv_persist_write_bytes", "kv_persist_commit_ms")},
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and last.get("generated") and last.get("decode_ms") else None,
                                 "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
@@ -4077,6 +4111,7 @@ def main() -> int:
                 raise SystemExit(f"[strata] config {e}")
             print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
         try:
+            close_deadline = engine_close_s(cfg)
             silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
@@ -4086,6 +4121,7 @@ def main() -> int:
             raise SystemExit(f"[strata] config {e}")
         engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                               env=env, lazy=lazy)
+        engine.close_s = close_deadline
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],

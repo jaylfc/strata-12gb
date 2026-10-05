@@ -1073,6 +1073,22 @@ class PcieShare(unittest.TestCase):
         self.assertEqual([r["pcie_share"] for r in rows], [0.2, 0.0, None])
         self.assertIn("expert cache 60.0% hit (+20.0% of the routed experts over PCIe)", out.getvalue())
 
+    def test_history_with_disk_metrics(self):
+        tok = ByteTokenizer()
+        engine = DoneLineEngine(tok, "</think>\n\nok", max_context=CTX, done_lines=[
+            "DONE 4 20 40.0 30.0 stop 3 5 10 60 100 0 0 0.0 10 25 10 2800000 12.3 3200000 45.6"])
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            list(svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event()))
+        row, = svc.history
+        self.assertEqual(row["hit_rate"], 0.6)
+        self.assertEqual(row["pcie_share"], 0.2)
+        self.assertEqual(row["kv_persist_restored_tokens"], 10)
+        self.assertEqual(row["kv_persist_read_bytes"], 2800000)
+        self.assertEqual(row["kv_persist_restore_ms"], 12.3)
+        self.assertEqual(row["kv_persist_write_bytes"], 3200000)
+        self.assertEqual(row["kv_persist_commit_ms"], 45.6)
+
 
 class LearnedProfile(unittest.TestCase):
     """#477: "expert_profile_save" in the config: the engine saves its learned profile there, and the next start

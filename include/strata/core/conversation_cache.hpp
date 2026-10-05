@@ -141,18 +141,25 @@ struct SavedConversation {
     }
 };
 
+// Image identity includes embedding bytes and the M-RoPE grid. A checkpoint
+// must carry exactly the images below its token extent, not just equal pad IDs.
+inline bool conversation_image_prefix(const std::vector<ConversationImageKey>& prefix,
+                                      size_t tokens, const std::vector<ConversationImageKey>& images) {
+    size_t j = 0;
+    for (const auto& image : images) {
+        if (image.start >= (int64_t) tokens) continue;
+        if (j == prefix.size() || !(prefix[j++] == image)) return false;
+    }
+    return j == prefix.size();
+}
+
 template<class Token>
 int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
                             const std::vector<ConversationImageKey>& images) {
     const size_t n = c.ids.size();
     // The last prompt token always starts the next verify window.
     if (n == 0 || n >= prompt.size() || !std::equal(c.ids.begin(), c.ids.end(), prompt.begin())) return 0;
-    size_t j = 0;
-    for (const auto& image : images) {
-        if (image.start >= (int64_t) n) continue;
-        if (j == c.imgs.size() || !(c.imgs[j++] == image)) return 0;
-    }
-    if (j != c.imgs.size()) return 0;
+    if (!conversation_image_prefix(c.imgs, n, images)) return 0;
     return (int64_t) n;
 }
 

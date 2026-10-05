@@ -651,6 +651,14 @@ prompt when that is 2,048 tokens or more (engine 0.1.20; PR #62 + #65), so that 
 system prompts and tool lists. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`,
 `--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
 
+**Disk conversation cache (opt-in).** Add `--kv-persist --kv-persist-identity MODEL_VERSION`
+to `"args"` to preserve completed conversations across graceful engine restarts.
+`--kv-persist-dir DIR` sets the directory (default `data/kv-cache` relative to the engine's
+working directory), and `--kv-persist-max-mib N` sets its shared LRU budget
+(default 30720 MiB, 30 GiB). It supports text and image INT8 serving with MTP and prompt
+checkpoints, including layer-split GPUs and batch slots. RAM conversation parking must be disabled.
+See [Disk KV cache](KV_PERSISTENCE.md) for saved state, commit timing and request metrics.
+
 **Multiple conversations (opt-in).** Add `--conversation-cache-mib 8192
 --conversation-cache-slots 4` to the engine arguments to park up to four conversations
 in a bounded 8 GiB host-RAM cache. This preserves controller/worker histories when
