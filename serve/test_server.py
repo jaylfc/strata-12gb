@@ -2872,5 +2872,367 @@ class LostStep(unittest.TestCase):
         self.run_mode("stop", stream=False)
 
 
+class ReasoningToolCall(unittest.TestCase):
+    """A tool call stranded in a thinking span that NEVER closes is rescued at end of stream, behind the
+    "stranded-call" format fix (--format-fixes).  Seen live as agents stopping silently: a template that
+    renders a call after the reasoning block never emits </think> before it, so the call streamed out as
+    reasoning_content and the client's turn ended with nothing to run.  A <tool_call> inside a span that
+    DOES close is a mention, however well-formed, and is never acted on; so is a tail that is not only
+    calls - prose between or after the blocks is the model narrating a call it considered - and an
+    opener that does not begin a line, or that sits inside a code fence, never starts a rescue at
+    all (#804's four live sightings all begin the call on its own line; a mid-sentence opener is
+    narration)."""
+
+    SCHEMA = [{"name": "Read", "parameters": {"properties": {"file_path": {"type": "string"},
+                                                             "offset": {"type": "integer"}}}}]
+
+    def run_parser(self, text, stream_tools, step, finish_reason="stop", fixes=("stranded-call",)):
+        from serve.frontend import OutputParser
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=stream_tools, fixes=fixes)
+        evs = []
+        for i in range(0, len(text), step):
+            evs += p.feed(text[i:i + step])
+        evs += p.finish(finish_reason)
+        return evs
+
+    def test_call_stranded_in_unclosed_thinking_is_rescued(self):
+        text = ("I need to inspect the kernel source first.\n<tool_call>\n<function=Read>\n"
+                "<parameter=file_path>\n/src/moe_mul1.cpp\n</parameter>\n<parameter=offset>\n30\n"
+                "</parameter>\n</function>\n</tool_call>")
+        for stream_tools in (False, True):
+            for step in (1, 7, 10_000):
+                with self.subTest(stream_tools=stream_tools, step=step):
+                    evs = self.run_parser(text, stream_tools, step)
+                    calls = [e.call for e in evs if e.kind == "tool_call"]
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0].name, "Read")
+                    self.assertEqual(calls[0].arguments, {"file_path": "/src/moe_mul1.cpp", "offset": 30})
+                    thought = "".join(e.text for e in evs if e.kind == "reasoning")
+                    self.assertIn("inspect the kernel source", thought)
+                    self.assertFalse([e for e in evs if e.kind == "content" and e.text.strip()])
+
+    def test_valid_example_in_closed_thinking_is_not_a_call(self):
+        # A valid, quoted call example closed by a real </think> stays reasoning.  The first version of
+        # this fix diverted at the opener and fired the example as a real call (and leaked a literal
+        # </think> into the content channel) - the review's false positive.
+        text = ("This is a documentation example, not an action:\n```xml\n<tool_call>\n<function=Read>\n"
+                "<parameter=file_path>\n/example.txt\n</parameter>\n</function>\n</tool_call>\n```\n"
+                "I should explain it without calling any tool.\n</think>Here is the explanation.")
+        for stream_tools in (False, True):
+            for step in (1, 7, 10_000):
+                with self.subTest(stream_tools=stream_tools, step=step):
+                    evs = self.run_parser(text, stream_tools, step)
+                    self.assertFalse([e for e in evs if e.kind == "tool_call"])
+                    thought = "".join(e.text for e in evs if e.kind == "reasoning")
+                    self.assertIn("/example.txt", thought)
+                    self.assertIn("I should explain it", thought)
+                    content = "".join(e.text for e in evs if e.kind == "content")
+                    self.assertEqual(content, "Here is the explanation.")
+
+    def test_call_with_trailing_prose_is_a_mention_even_with_the_fix_on(self):
+        # The tail contract, with the fix ON: prose after the last complete block is a mention's shape (the
+        # model narrated past a call it considered); every live sighting of the bug ends ON the block.  This
+        # flips the first version of this fix, which rescued this shape (the trailing-thought test).
+        text = ("planning\n<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n"
+                "</function>\n</tool_call>\nlet me see what comes back.")
+        evs = self.run_parser(text, False, 7)
+        self.assertFalse([e for e in evs if e.kind == "tool_call"])
+        thought = "".join(e.text for e in evs if e.kind == "reasoning")
+        self.assertIn("let me see what comes back", thought)
+
+    def test_review_example_unclosed_with_the_fix_on_stays_reasoning(self):
+        # The review's remaining ambiguity, unclosed and with the fix on: the disclaimed documentation
+        # example with its </think> removed.  The "```" and prose after the block make it a mention under
+        # the tail contract; the fix never sees a stranded act.
+        text = ("This is a documentation example, not an action:\n```xml\n<tool_call>\n<function=Read>\n"
+                "<parameter=file_path>\n/example.txt\n</parameter>\n</function>\n</tool_call>\n```\n"
+                "I should explain it without calling any tool.")
+        for stream_tools in (False, True):
+            for step in (1, 7, 10_000):
+                with self.subTest(stream_tools=stream_tools, step=step):
+                    evs = self.run_parser(text, stream_tools, step)
+                    self.assertFalse([e for e in evs if e.kind == "tool_call"])
+                    thought = "".join(e.text for e in evs if e.kind == "reasoning")
+                    self.assertIn("/example.txt", thought)
+                    self.assertIn("I should explain it", thought)
+
+    def test_quoted_call_in_a_max_tokens_cut_is_not_rescued(self):
+        # The review's case: a reply cut by max tokens most often leaves the thinking span
+        # open mid-thought - a complete call quoted inside that reasoning was something the
+        # model CONSIDERED ("but first let me check..."), not did.  A turn that did not end
+        # by itself never rescues.
+        text = ("I could run\n<tool_call>\n<function=Bash>\n<parameter=command>\nrm -rf build\n"
+                "</parameter>\n</function>\n</tool_call>\nbut first let me check what build holds...")
+        evs = self.run_parser(text, False, 7, finish_reason="length")
+        self.assertFalse([e for e in evs if e.kind == "tool_call"])
+        thought = "".join(e.text for e in evs if e.kind == "reasoning")
+        self.assertIn("rm -rf build", thought)          # it all stays reasoning
+
+    def test_a_natural_stop_still_rescues_the_same_shape(self):
+        # The same text ending BY ITSELF is the live bug's shape - the model went from
+        # thought to call with no </think> and stopped.  The gate must not lose it.
+        text = ("planning.\n\n<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n"
+                "</function>\n</tool_call>")
+        evs = self.run_parser(text, False, 7, finish_reason="stop")
+        calls = [e.call for e in evs if e.kind == "tool_call"]
+        self.assertEqual([(c.name, c.arguments) for c in calls], [("Read", {"file_path": "/a"})])
+
+    def test_stranded_shape_without_the_fix_stays_reasoning_and_says_so(self):
+        # Off (the default): the stream is byte-identical, nothing is rescued - but the parser names the
+        # detected shape so the serve can log it fail-loud (the #530 pattern: never guess, say what was seen).
+        from serve.frontend import OutputParser
+        text = ("I need the file.\n<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n"
+                "</function>\n</tool_call>")
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=False)
+        evs = p.feed(text) + p.finish("stop")
+        self.assertFalse([e for e in evs if e.kind == "tool_call"])
+        self.assertEqual(p.adaptations, [])
+        self.assertEqual(p.format_hint, "stranded-call")
+
+    def test_a_rescue_names_itself_in_adaptations(self):
+        # An applied fix records its name: the serve logs it and lists it in the reply's "adaptations",
+        # so a rescued turn is always distinguishable from a clean one.
+        from serve.frontend import OutputParser
+        text = ("planning.\n\n<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n"
+                "</function>\n</tool_call>")
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=False, fixes=("stranded-call",))
+        evs = p.feed(text) + p.finish("stop")
+        self.assertTrue([e for e in evs if e.kind == "tool_call"])
+        self.assertEqual(p.adaptations, ["stranded-call"])
+        self.assertIsNone(p.format_hint)
+
+    def test_two_stranded_calls_are_both_rescued(self):
+        text = ("a\n<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n</function>\n"
+                "</tool_call>\n<tool_call>\n<function=Read>\n<parameter=file_path>\n/b\n</parameter>\n"
+                "</function>\n</tool_call>")
+        evs = self.run_parser(text, False, 7)
+        calls = [e.call for e in evs if e.kind == "tool_call"]
+        self.assertEqual([c.arguments for c in calls], [{"file_path": "/a"}, {"file_path": "/b"}])
+
+    def test_prose_between_two_calls_is_a_mention_not_two_acts(self):
+        # The tail contract between blocks: only whitespace may separate them - "b" here is the model
+        # narrating between two calls it considered.
+        text = ("a\n<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n</function>\n"
+                "</tool_call>b<tool_call>\n<function=Read>\n<parameter=file_path>\n/b\n</parameter>\n"
+                "</function>\n</tool_call>")
+        evs = self.run_parser(text, False, 7)
+        self.assertFalse([e for e in evs if e.kind == "tool_call"])
+
+    def test_midsentence_opener_is_a_mention_not_an_act(self):
+        # The review's residual case, with the fix ON: a complete, unfenced call as the last thing of an
+        # unclosed span that stops by itself, but written MID-SENTENCE - narration grammar, not an act.
+        # Only the opener's position tells them apart, and all four live sightings (#804) begin the call
+        # on its own line, so an opener that continues a sentence never starts a rescue.
+        from serve.frontend import OutputParser
+        text = ("I could run <tool_call>\n<function=Bash>\n<parameter=command>\nrm -rf build\n"
+                "</parameter>\n</function>\n</tool_call>")
+        for step in (1, 7, 10_000):
+            with self.subTest(step=step):
+                p = OutputParser(thinking=True, tools=[{"name": "Bash", "parameters": {"properties":
+                    {"command": {"type": "string"}}}}], stream_tools=False, fixes=("stranded-call",))
+                evs = []
+                for i in range(0, len(text), step):
+                    evs += p.feed(text[i:i + step])
+                evs += p.finish("stop")
+                self.assertFalse([e for e in evs if e.kind == "tool_call"])
+                self.assertIn("rm -rf build", "".join(e.text for e in evs if e.kind == "reasoning"))
+                self.assertEqual(p.adaptations, [])
+                self.assertIsNone(p.format_hint)      # not even the stranded shape: no tail ever started
+
+    def test_opener_inside_a_code_fence_never_starts_a_tail(self):
+        # A quoted example in a fence is a mention even when it is the very last thing before the stop
+        # (the model stopped before closing the fence, so no trailing ``` exists to reject it) - the open
+        # fence alone is the tell.  The same call after the fence CLOSES is a stranded act again.
+        from serve.frontend import OutputParser
+        TOOLS = self.SCHEMA
+        fenced = ("For example:\n```\n<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n"
+                  "</parameter>\n</function>\n</tool_call>")
+        after = ("For example:\n```\nan example of the format\n```\n\n<tool_call>\n"
+                 "<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n</function>\n</tool_call>")
+        for label, text, rescued in (("fence open at the stop", fenced, False),
+                                     ("fence closed, then a real call", after, True)):
+            with self.subTest(case=label):
+                p = OutputParser(thinking=True, tools=TOOLS, stream_tools=False, fixes=("stranded-call",))
+                evs = p.feed(text) + p.finish("stop")
+                calls = [e.call for e in evs if e.kind == "tool_call"]
+                if rescued:
+                    self.assertEqual([(c.name, c.arguments) for c in calls],
+                                     [("Read", {"file_path": "/a"})])
+                else:
+                    self.assertFalse(calls)
+
+    def test_malformed_mention_in_unclosed_thinking_stays_reasoning(self):
+        text = "the format is\n<tool_call>\nnot a call body at all\n</tool_call>"
+        for step in (1, 7, 10_000):
+            with self.subTest(step=step):
+                evs = self.run_parser(text, False, step)
+                self.assertFalse([e for e in evs if e.kind == "tool_call"])
+                self.assertIn("not a call body at all",
+                              "".join(e.text for e in evs if e.kind == "reasoning"))
+
+    def test_think_end_still_wins_when_it_comes_first(self):
+        text = ("brief thought</think>prose<tool_call>\n<function=Read>\n"
+                "<parameter=file_path>\n/a\n</parameter>\n</function>\n</tool_call>")
+        for stream_tools in (False, True):
+            with self.subTest(stream_tools=stream_tools):
+                evs = self.run_parser(text, stream_tools, 7)
+                thought = "".join(e.text for e in evs if e.kind == "reasoning")
+                self.assertEqual(thought, "brief thought")
+                contents = "".join(e.text for e in evs if e.kind == "content")
+                self.assertEqual(contents.strip(), "prose")
+                self.assertEqual(len([e for e in evs if e.kind == "tool_call"]), 1)
+
+    def test_unfinished_stranded_call_is_not_rescued(self):
+        # An output cut by max tokens mid-call stays reasoning (the #530 log names the cause).
+        text = "planning\n<tool_call>\n<function=Read>\n<parameter=file_path>\n/sr"
+        evs = self.run_parser(text, False, 7)
+        self.assertFalse([e for e in evs if e.kind == "tool_call"])
+
+    def test_mention_only_controls(self):
+        # The ten mention shapes of #970 (controls recorded alongside the live failures): none may start
+        # a rescue, whatever the chunking - the opener is quoted, mid-sentence, indented, in a markdown
+        # quote, in a fence, or the span closes right after it.
+        from serve.frontend import OutputParser
+        CALL = "<tool_call>\n<function=execute_code>\n<parameter=code>\nx\n</parameter>\n</function>\n</tool_call>"
+        CONTROLS = {
+            "backticks mid-sentence": "I must emit `<tool_call>` then `<function=execute_code>` - the format.\n",
+            "mid-sentence, whole call": "The format is <tool_call>\n<function=execute_code>\n</function>\n</tool_call> ok.\n",
+            "backticks at line start": "Plan:\n`<tool_call>\n<function=execute_code>` comes next.\n",
+            "line start, no <function=": "Next step:\n<tool_call> is the tag the format starts with.\n",
+            "line start, other tag after": "Example:\n<tool_call>\n<parameter=code>\nx\n</parameter>\n",
+            "indented": "As a list:\n  <tool_call>\n  <function=execute_code>\n",
+            "markdown quote": "The doc says:\n> <tool_call>\n> <function=execute_code>\n",
+            "``` code block": "Format:\n```xml\n" + CALL + "\n```\nThat is how a call looks.\n",
+            "~~~ code block": "Format:\n~~~\n" + CALL + "\n~~~\nDone.\n",
+            "tag right before </think>": "So I call it:\n<tool_call>\n</think>Here is the answer.",
+        }
+        tools = [{"name": "execute_code", "parameters": {"properties": {"code": {"type": "string"}}}}]
+        for label, text in CONTROLS.items():
+            for step in (1, 7, 10_000):
+                with self.subTest(control=label, step=step):
+                    p = OutputParser(thinking=True, tools=tools, stream_tools=False,
+                                     fixes=("stranded-call",))
+                    evs = []
+                    for i in range(0, len(text), step):
+                        evs += p.feed(text[i:i + step])
+                    evs += p.finish("stop")
+                    self.assertFalse([e for e in evs if e.kind == "tool_call"], label)
+                    self.assertEqual(p.adaptations, [], label)
+
+    def test_call_after_think_end_uses_the_content_channel(self):
+        # The span closes FIRST (or there was none): the call that follows is ordinary content-channel
+        # parsing, untouched by the fix.  (An earlier version of this test fed the call into a span it
+        # closed only after finish(), and passed by the rescue - not by the content channel.)
+        for thinking, text in (
+            (True, "x</think>prose<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n"
+                   "</function>\n</tool_call>"),
+            (False, "prose<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n"
+                    "</function>\n</tool_call>"),
+        ):
+            with self.subTest(thinking=thinking):
+                from serve.frontend import OutputParser
+                p = OutputParser(thinking=thinking, tools=self.SCHEMA, stream_tools=False,
+                                 fixes=("stranded-call",))
+                evs = p.feed(text) + p.finish()
+                calls = [e.call for e in evs if e.kind == "tool_call"]
+                self.assertEqual([(c.name, c.arguments) for c in calls], [("Read", {"file_path": "/a"})])
+
+
+
+class FormatFixesOption(unittest.TestCase):
+    """The --format-fixes / config "format_fixes" grammar: off | all | names (one, comma-separated, or a JSON
+    list; the forms mix freely).  A typo fails the start naming the known ones, instead of silently
+    disabling a fix."""
+
+    def parse(self, value):
+        return Service.parse_format_fixes(value)
+
+    def test_grammar(self):
+        from serve.frontend import KNOWN_FORMAT_FIXES
+        for off in (None, False, "", "off"):
+            self.assertEqual(self.parse(off), frozenset(), off)
+        for on in (True, "all"):
+            self.assertEqual(self.parse(on), frozenset(KNOWN_FORMAT_FIXES), on)
+        self.assertEqual(self.parse("stranded-call"), frozenset({"stranded-call"}))
+        self.assertEqual(self.parse(" stranded-call "), frozenset({"stranded-call"}))
+        self.assertEqual(self.parse("off, stranded-call"), frozenset({"stranded-call"}))
+        self.assertEqual(self.parse("stranded-call,stranded-call"), frozenset({"stranded-call"}))
+        self.assertEqual(self.parse(["stranded-call"]), frozenset({"stranded-call"}))
+        self.assertEqual(self.parse(["stranded-call", "all"]), frozenset(KNOWN_FORMAT_FIXES))
+        self.assertEqual(self.parse(["off", "stranded-call"]), frozenset({"stranded-call"}))
+
+    def test_an_unknown_name_fails_naming_the_known_ones(self):
+        # The other members of the format's quirk family (#211's cut call, #530's empty reply) are the
+        # names a user reaches for next; they must fail loudly with the known list, not silently no-op.
+        with self.assertRaises(ValueError) as cm:
+            self.parse("stranded-call,cut-call,empty-reply")
+        self.assertIn("'cut-call'", str(cm.exception))
+        self.assertIn("known: off, all, stranded-call", str(cm.exception))
+        for bad in (7, ["stranded-call", 7], {"stranded-call"}):
+            with self.assertRaises(ValueError):
+                self.parse(bad)
+
+
+class FormatFixCorpus(unittest.TestCase):
+    """The specimen collection of the format-fix family, serve/fixtures/format_fix_specimens.json:
+    every shape the fixes have been measured against.  Each entry is a complete synthetic message
+    and the expected delta: the exact calls each flag state delivers, the flag-off hint, and the
+    streamed text's fate ("unchanged" - the level-1 contract).  Run at three chunk sizes with
+    stream_tools on and off.  A new shape is a data append, not new test code - and a change to any
+    trigger re-runs the whole recorded world, so fixing one case cannot silently break another.
+    Every specimen is the generic shape; where it was seen is the source link."""
+
+    def specimens(self):
+        from pathlib import Path
+        path = Path(__file__).resolve().parents[1] / "serve" / "fixtures" / "format_fix_specimens.json"
+        return json.loads(path.read_text(encoding="utf-8"))["specimens"]
+
+    def test_corpus(self):
+        """A specimen is one copy of the message (the before) plus the delta (the after): the exact
+        calls each flag state delivers, and the flag-off hint.  expect.text is the streamed text's
+        fate - "unchanged" means the two states produce byte-identical reasoning and content, which
+        is the level-1 contract stated once; a future fix that rewrites the stream states the string
+        in the same field.  The runner proves the delta and nothing else differs."""
+        import random
+        from serve.frontend import OutputParser
+        for sp in self.specimens():
+            exp = sp["expect"]
+            for step in (1, 7, "random 1-9", 10 ** 9):
+                for st in (False, True):
+                    with self.subTest(name=sp["name"], step=step, stream_tools=st):
+                        text = sp["input"]
+                        if isinstance(step, str):        # the review's feeding mode: random contiguous
+                            r = random.Random(7)         # chunks, seeded so both states see the same cuts
+                            pieces, i = [], 0
+                            while i < len(text):
+                                n = r.randint(1, 9)
+                                pieces.append(text[i:i + n])
+                                i += n
+                        else:
+                            pieces = [text[i:i + step] for i in range(0, len(text), step)]
+                        runs = []
+                        for fixes in ((), ("stranded-call",)):
+                            p = OutputParser(thinking=True, stream_tools=st, fixes=fixes,
+                                             tools=[{"name": n, "parameters": {"properties":
+                                                     {"code": {"type": "string"}}}} for n in sp["tools"]])
+                            evs = []
+                            for piece in pieces:
+                                evs += p.feed(piece)
+                            evs += p.finish(sp["finish"])
+                            runs.append((p, [[e.call.name, e.call.arguments] for e in evs if e.kind == "tool_call"],
+                                         "".join(e.text for e in evs if e.kind in ("reasoning", "content"))))
+                        (p_off, calls_off, text_off), (p_on, calls_on, text_on) = runs
+                        self.assertEqual(calls_on, exp["on"])
+                        self.assertEqual(calls_off, exp["off"])
+                        self.assertEqual(p_off.format_hint, exp["hint"])
+                        # a stranded act nothing delivers (an envelope) is loud in BOTH states
+                        self.assertEqual(bool(p_off.format_note), bool(exp.get("note")))
+                        self.assertEqual(bool(p_on.format_note), bool(exp.get("note")))
+                        if exp["text"] == "unchanged":
+                            self.assertEqual(text_on, text_off)
+                        else:
+                            self.assertEqual(text_on, exp["text"])
+
+
 if __name__ == "__main__":
     unittest.main()

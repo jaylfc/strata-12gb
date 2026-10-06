@@ -470,11 +470,22 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     return ToolCall(name=name, arguments=args)
 
 
+# The named adaptations --format-fixes may turn on (the flag's grammar is "off" | "all" | a comma list of these;
+# the serve parses it - Service.parse_format_fixes).  Each one is an append-at-end-of-turn correction to a quirk
+# of the one output format the serve speaks, Qwen-style <think>/<tool_call>; nothing that already streamed ever
+# changes, and every adaptation that fires logs and is listed in the reply's "adaptations".
+#   stranded-call  a complete, well-formed tool call left in reasoning by a thinking span that never closed is
+#                  delivered as a real call - a template that renders a call after the reasoning block never
+#                  emits </think> before it, and without this the client's turn ends with nothing to execute
+KNOWN_FORMAT_FIXES = ("stranded-call",)
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
-    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
+                 fixes=()):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
@@ -484,6 +495,27 @@ class OutputParser:
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
         # nothing until the call is complete, which for a large file write can be many minutes.
         self.stream_tools = stream_tools
+        # Reasoning text from the first <tool_call> opener while the thinking span is still open, kept so
+        # finish() can rescue a call stranded by a template that never emits </think> (see
+        # _rescue_unclosed_call).  Cleared the moment the span closes: a call inside a CLOSED span was a
+        # mention, however valid, and must never be acted on.
+        self.reasoning_tail: str | None = None
+        # the enabled format adaptations (KNOWN_FORMAT_FIXES names); off = no adaptation ever fires, and a
+        # detected shape then only raises self.format_hint, which the serve logs fail-loud
+        self.fixes = frozenset(fixes or ())
+        # the names of the adaptations finish() applied, oldest first (the serve logs them and reports them in
+        # the reply's "adaptations"), and the name of a detected shape no enabled fix covers
+        self.adaptations: list[str] = []
+        self.format_hint: str | None = None
+        # a stranded act that no enabled fix can deliver (its blocks name tools the request did not
+        # declare): what was seen, logged by the serve in BOTH flag states - loud without promising
+        # a fix, unlike format_hint, which names a fix that really would have delivered the call
+        self.format_note: str | None = None
+        # line/fence state ahead of the tail (see _track_reasoning): the partial line carried across
+        # chunks ("" = the next text starts a line / nothing seen yet), and whether a line-start ``` or
+        # ~~~ has the reasoning inside a quoted code block
+        self._pre_tail_line = ""
+        self._in_fence = False
         self._reset_scan()
 
     def _reset_scan(self):
@@ -606,6 +638,113 @@ class OutputParser:
                     best = max(best, n)
         return best
 
+    def _track_reasoning(self, text: str) -> None:
+        """Keep the reasoning tail used by _rescue_unclosed_call: everything emitted as reasoning from the
+        first <tool_call> opener, while the thinking span is still open.  An opener only starts a tail at
+        the start of a line, outside a fenced code block: every live sighting of the bug (#804, four real
+        failures) has the call beginning on its own line, while an opener woven into a sentence ("I could
+        run <tool_call>") or quoted inside a fence is the model narrating, and never starts a rescue."""
+        if self.reasoning_tail is not None:
+            self.reasoning_tail += text
+            return
+        at = 0
+        while self.reasoning_tail is None:
+            c = text.find(CALL_START, at)
+            if c < 0:
+                break
+            self._tail_track(text[at:c])               # brings the line/fence state up to the opener
+            if self._pre_tail_line == "" and not self._in_fence:
+                self.reasoning_tail = text[c:]
+                return
+            at = c + 1                                  # in a sentence or a fence: keep scanning
+        self._tail_track(text[at:])
+
+    def _tail_track(self, text: str) -> None:
+        """The line/fence state of the reasoning before a tail starts (see _track_reasoning): the current
+        line carried across chunks - "" once a "\\n" ends it, so an opener at the start of a chunk is at
+        the start of a line - and whether a line-start ``` or ~~~ opened a quoted code block that has not
+        closed yet.  Deliberately simple: any line-start fence marker toggles, with no indent or length
+        matching."""
+        parts = (self._pre_tail_line + text).split("\n")
+        self._pre_tail_line = parts.pop()
+        for p in parts:
+            if p.startswith(("```", "~~~")):
+                self._in_fence = not self._in_fence
+
+    def _rescue_blocks(self, tail: str) -> "list[str] | None":
+        """The kept tail as its complete call-shaped bodies (`<function=...>...</function>`), or None
+        when the tail is not only such blocks separated by whitespace.  The tail starts at a
+        <tool_call> opener (see _track_reasoning), so anything else in it - prose between or after the
+        blocks, an unfinished block, a body without `<function=` - is the model narrating a call it
+        considered, not making one, and stays what it already streamed as, silently.  This is the
+        DETECTION: whether the detected act can be delivered (declared names, parseable bodies) is
+        decided by the caller, because an undeliverable stranded act must still be heard - 2 of the 12
+        live strandings in the review corpus, and 3 of the 4 in #804, are `<function=tool_call>`
+        envelopes naming a tool no request declares."""
+        blocks, rest = [], tail
+        while True:
+            rest = rest.lstrip()
+            if not rest:
+                return blocks
+            if not rest.startswith(CALL_START):
+                return None
+            b = rest.find(CALL_END, len(CALL_START))
+            if b < 0:
+                return None                  # an unfinished call stays reasoning
+            body, rest = rest[len(CALL_START):b], rest[b + len(CALL_END):]
+            s = body.strip()
+            if not s.startswith("<function="):
+                return None
+            blocks.append(s)
+
+    def _rescue_unclosed_call(self, finish_reason: str = "stop") -> list[Event]:
+        """End of generation inside a thinking span that never closed, gated on the "stranded-call" format
+        fix.  A template that renders a call after the reasoning block never emits </think> before it, so
+        the whole call streams out as reasoning_content and a client that runs tools from the content
+        channel ends its turn with nothing to execute.  Four things must hold before a tail counts as a
+        stranded act: the turn ended by itself ("length" most often leaves the span open mid-thought, and a
+        complete call quoted in that reasoning was something the model CONSIDERED, not did), the opener
+        began a line outside any code fence (see _track_reasoning - all four live sightings in #804 are
+        "\\n\\n<tool_call>\\n<function=", while a mid-sentence opener is narration), the tail is
+        only complete, well-formed calls separated by whitespace (see _rescue_calls - prose after the last
+        block is a mention's shape; every live sighting of the bug ends ON the block), and every body parses
+        against the request's schemas.  A </think> after the opener clears the tail (a mention inside genuine
+        reasoning).  With the fix off, the same detection only raises self.format_hint: the serve logs it and
+        changes nothing, so the default fails loud instead of leaving a silent stall."""
+        if finish_reason != "stop":
+            self.reasoning_tail = None
+            return []
+        tail, self.reasoning_tail = self.reasoning_tail, None
+        if not tail:
+            return []
+        blocks = self._rescue_blocks(tail)
+        if blocks is None:
+            return []                          # not an act's shape: a mention stays a mention, silently
+        names = [b[len("<function="):].split(">", 1)[0] for b in blocks]
+        undeclared = sorted({n for n in names if n not in self.schemas})
+        if undeclared:
+            # an act's shape that names tool(s) the request did not declare (the envelope).  No
+            # enabled fix delivers this - not even with the flag on - so format_hint would be a
+            # promise the fix cannot keep; format_note says what was seen instead, and the serve
+            # logs it in BOTH states.  A mixed tail (a declared call beside an undeclared one) lands
+            # here too: all-or-nothing by design, but never silent.
+            self.format_note = (f"{len(blocks)} complete tool call{'s' if len(blocks) != 1 else ''} left in "
+                                f"reasoning by an unclosed thinking span name{'s' if len(blocks) == 1 else ''} "
+                                f"a tool the request did not declare ({', '.join(undeclared)}); nothing delivers "
+                                f"this, so they stayed reasoning")
+            return []
+        calls = []
+        for b, n in zip(blocks, names):
+            try:
+                calls.append(parse_tool_call(b, self.schemas.get(n)))
+            except ValueError:
+                return []                      # a body that does not parse stays reasoning
+        if "stranded-call" not in self.fixes:
+            self.format_hint = "stranded-call"   # detected but not enabled: the serve says so, changes nothing
+            return []
+        self.adaptations.append("stranded-call")
+        return [Event("tool_call", call=call) for call in calls]
+
     def feed(self, delta: str) -> list[Event]:
         self.buf += delta
         out: list[Event] = []
@@ -613,15 +752,19 @@ class OutputParser:
             if self.state == "reasoning":
                 i = self.buf.find(THINK_END)
                 if i < 0:
-                    keep = self._hold(self.buf, (THINK_END,))
+                    # Hold a partial </think> or <tool_call> (the tail tracker must see a whole opener).
+                    keep = self._hold(self.buf, (THINK_END, CALL_START))
                     if len(self.buf) > keep:
-                        out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
+                        text = self.buf[:len(self.buf) - keep]
+                        out.append(Event("reasoning", text))
+                        self._track_reasoning(text)
                         self.buf = self.buf[len(self.buf) - keep:]
                     return out
                 if i:
                     out.append(Event("reasoning", self.buf[:i]))
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
+                self.reasoning_tail = None   # the span closed: a <tool_call> inside it was a mention
             elif self.state == "content":
                 if self.lead:                                   # newlines right after </think> or a call
                     stripped = self.buf.lstrip("\n")
@@ -666,9 +809,11 @@ class OutputParser:
                 self._reset_scan()
                 self.state, self.lead = "content", True
 
-    def finish(self) -> list[Event]:
+    def finish(self, finish_reason: str = "stop") -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
-        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211)."""
+        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211).
+        `finish_reason` gates the unclosed-thinking rescue (see _rescue_unclosed_call); an applied fix names
+        itself in self.adaptations, and a detected-but-disabled one in self.format_hint."""
         out = []
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
@@ -681,5 +826,7 @@ class OutputParser:
             kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
             text = self.buf if self.state != "call" else CALL_START + self.buf
             out.append(Event(kind, text))
+            if self.state == "reasoning":
+                self._track_reasoning(text)
             self.buf = ""
-        return out
+        return out + self._rescue_unclosed_call(finish_reason)
