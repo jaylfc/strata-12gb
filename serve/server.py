@@ -157,6 +157,12 @@ class GpuBusy(RuntimeError):
     model server) is using it, so the engine is not started into the little that is left."""
 
 
+class VisionUnavailable(GpuBusy):
+    """The hot vision encoder (the config's "vision": {"hot": true}) could not be brought up for a request with an
+    image: the expert cache did not shrink, or the encoder did not start, and no CPU encoder is configured.  A 503:
+    the cache was grown back, text requests keep working, and the next image request tries again."""
+
+
 ENGINE_REQUEST = re.compile(
     # "+ 12288 of 98179 read": a request cancelled while its prompt was read (#471)
     r"prompt (?P<prompt>\d+) tokens = (?P<reused>\d+) reused \+ \d+(?: of \d+)? read in (?P<read>[\d.]+) ms "
@@ -1288,7 +1294,8 @@ class Vision:
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
     sends the same picture again (every turn, with most clients) encodes it once."""
 
-    def __init__(self, cfg: dict, log=None, env: dict | None = None):
+    def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True):
+        """start=False (the hot mode, "vision": {"hot": true}): the process is not started until restart()."""
         args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
         if cfg.get("gpu"):
             args.append("--gpu")
@@ -1298,10 +1305,12 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
         self.spawn = (args, log, env)                   # to start it again after an unload
-        self.stopped = False
-        self._start()
+        self.proc = None
+        self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
+        if start:
+            self._start()
 
     def _start(self):
         args, log, env = self.spawn
@@ -1314,7 +1323,7 @@ class Vision:
         self.stopped = False
 
     def alive(self) -> bool:
-        return not self.stopped and self.proc.poll() is None
+        return not self.stopped and self.proc is not None and self.proc.poll() is None
 
     def unload(self):
         """Stop the encoder process (its VRAM or RAM goes back); the encoded images stay cached on disk."""
@@ -1324,10 +1333,18 @@ class Vision:
     def restart(self):
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
         try:
-            self.proc.kill()
+            if self.proc is not None:
+                self.proc.kill()
         except OSError:
             pass
         self._start()
+
+    def cached(self, source: str) -> tuple[str, bytes, tuple[Path, int] | None]:
+        """-> (key, the image's bytes, its cached encoding or None): whether an encode would need the process."""
+        data = self.normalize(self.load(source))
+        key = hashlib.sha256(data).hexdigest()[:32]
+        with self.lock:
+            return key, data, self.cache.get(key)
 
     @staticmethod
     def load(source: str) -> bytes:
@@ -1370,9 +1387,9 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
-    def encode(self, source: str) -> tuple[Path, int]:
-        """-> (embeddings file, number of image tokens)."""
-        data = self.normalize(self.load(source))
+    def encode(self, source: str, data: bytes | None = None) -> tuple[Path, int]:
+        """-> (embeddings file, number of image tokens).  `data`: the image's bytes already read (Vision.cached)."""
+        data = self.normalize(self.load(source)) if data is None else data
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
@@ -1395,12 +1412,73 @@ class Vision:
             return self.cache[key]
 
     def close(self):
+        if self.proc is None:
+            return
         try:
             self.proc.stdin.write("QUIT\n")
             self.proc.stdin.flush()
             self.proc.wait(timeout=10)
         except Exception:
             self.proc.kill()
+
+
+VISION_HOT_ENCODER_MIB = 1400   # a GPU encoder's VRAM (weights + compute), docs/DETAILS.md "Images": "~1.4 GB of
+                                # VRAM is kept free for it" - the docs' figure, not measured on the hot path yet
+ENGINE_DEFAULT_RESERVE_MIB = 700   # the engine's --vram-reserve-mib when the config gives none (generate.cpp)
+
+
+def vision_hot_config(cfg: dict) -> dict | None:
+    """The config's "vision": {"hot": true, ...} (opt-in): the encoder is started only for a request with an image,
+    after the elastic expert cache (#533) shrinks to make room, and stopped again (the cache growing back) after
+    "idle_unload_s" without one.  None when it is off; ValueError for a config it cannot run with.
+    Keys: idle_unload_s (120), reserve_mib ("auto": the engine's start reserve + VISION_HOT_ENCODER_MIB, or the
+    VRAM to keep free in MiB while the encoder runs), shrink_timeout_s (30), cpu_fallback (false: a 503 when the
+    GPU encoder cannot come up; true or a dict of vision keys: a CPU encoder instead)."""
+    v = cfg.get("vision")
+    if not isinstance(v, dict) or v.get("hot") is not True:
+        return None
+    if cfg.get("vram_elastic") is not True:
+        raise ValueError('"vision": {"hot": true} needs "vram_elastic": true (the expert cache gives the encoder '
+                         'its VRAM only while it runs)')
+    if len(gpu_list(cfg)) > 1:
+        raise ValueError('"vision": {"hot": true} needs one GPU (vram_elastic does not resize a layer split)')
+
+    def number(key, default, low):
+        x = v.get(key, default)
+        if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < low:
+            raise ValueError(f'"vision": "{key}" must be a number >= {low} (got {x!r})')
+        return float(x)
+
+    idle = number("idle_unload_s", 120, 1)
+    timeout = number("shrink_timeout_s", 30, 1)
+    reserve = v.get("reserve_mib", "auto")
+    if reserve != "auto":
+        if isinstance(reserve, bool) or not isinstance(reserve, int) or reserve < 0:
+            raise ValueError(f'"vision": "reserve_mib" must be "auto" or MiB >= 0 (got {reserve!r})')
+    args = cfg.get("args") or []
+    start = ENGINE_DEFAULT_RESERVE_MIB
+    if "--vram-reserve-mib" in args[:-1]:
+        try:
+            start = int(args[args.index("--vram-reserve-mib") + 1])
+        except ValueError:
+            pass
+    fb = v.get("cpu_fallback", False)
+    if fb is not False and fb is not True and not isinstance(fb, dict):
+        raise ValueError('"vision": "cpu_fallback" must be true, false or a dict of vision keys')
+    return {"idle_unload_s": idle, "shrink_timeout_s": timeout, "reserve_mib": reserve, "start_reserve_mib": start,
+            "cpu_fallback": fb}
+
+
+def vision_cpu_config(vcfg: dict, fb) -> dict:
+    """The CPU encoder a hot GPU encoder falls back to: the same files, no --gpu, setup's CPU picture size (300
+    tokens) unless the fallback dict says otherwise."""
+    out = {k: x for k, x in vcfg.items() if k not in ("gpu", "hot", "idle_unload_s", "reserve_mib",
+                                                      "shrink_timeout_s", "cpu_fallback", "cuda_device")}
+    out["max_tokens"] = 300
+    if isinstance(fb, dict):
+        out.update(fb)
+    out.pop("gpu", None)
+    return out
 
 
 def gpu_list(cfg: dict) -> list[int]:
@@ -1833,6 +1911,15 @@ class Service:
         self.min_free_vram_mib = 0
         self.before_load = None
         self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
+        # the hot vision encoder (opt-in, "vision": {"hot": true}): vision_hot_config()'s dict when on.  The encoder
+        # is down between image requests; vision_shrunk says the expert cache was shrunk for it (and must grow back)
+        self.vision_hot = None
+        self.vision_cpu = None                           # the CPU encoder it falls back to (a Vision, not started)
+        self.vision_shrunk = False
+        self.last_image_at = None
+        self.vision_hot_stats = {"requests": 0, "cold_starts": 0, "fallbacks": 0, "failures": 0, "unloads": 0,
+                                 "grow_failures": 0, "shrink_ms_total": 0.0, "start_ms_total": 0.0,
+                                 "encode_ms_total": 0.0, "last": None, "last_unload": None}
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         # --format-fixes / the config's "format_fixes" (off by default): the enabled output-format adaptations
@@ -1919,6 +2006,8 @@ class Service:
         return frozenset(fixes)
 
     def _vision_down(self) -> bool:
+        if self.vision_hot:                             # hot: a stopped encoder is the normal state between images
+            return False
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
 
     def free_vram_mib(self) -> int | None:
@@ -1973,6 +2062,8 @@ class Service:
                   "(a minute or two) ...", flush=True)
         self.engine.restart()
         print("[strata] the engine is running again", flush=True)
+        if self.vision_hot:      # an encoder that outlived the engine (it died) held its VRAM while the cache was
+            self.vision_shrunk = self._hot_encoder_alive()   # sized: grow when it stops, as after a shrink
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
                 self.engine.vram(self.vram_reserve)
@@ -2001,7 +2092,11 @@ class Service:
                 self.vram_reserve = reserve_mib
                 return {"status": "not loaded", "reserve_mib": reserve_mib,
                         "note": "applied when the model loads"}
-            out = self.engine.vram(reserve_mib)
+            applied = reserve_mib
+            if self.vision_shrunk:                       # the hot encoder is running: keep its room as well
+                base = self.vision_hot["start_reserve_mib"] if reserve_mib is None else reserve_mib
+                applied = max(base, self.hot_reserve_mib(base))
+            out = self.engine.vram(applied)
             self.vram_reserve = reserve_mib
             print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
                   f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
@@ -2010,6 +2105,200 @@ class Service:
             if ctl is not None:
                 ctl.release()
             self.fifo.release()
+
+    # ---- the hot vision encoder (opt-in): started for an image request after the elastic cache shrinks, stopped
+    # after vision_hot["idle_unload_s"] without one (the cache grows back).  Every step runs with self.fifo held - the
+    # same lock the requests, POST /v1/vram and the idle unload take - so it never overlaps a request.
+
+    def _hot_encoder_alive(self) -> bool:
+        return bool(self.vision is not None and self.vision.alive() or
+                    self.vision_cpu is not None and self.vision_cpu.alive())
+
+    def hot_reserve_mib(self, base: int | None = None) -> int:
+        """The VRAM kept free while the hot encoder runs: the config's figure, or ("auto") the reserve in force
+        (the last POST /v1/vram's, else the engine's start reserve) + VISION_HOT_ENCODER_MIB."""
+        h = self.vision_hot
+        if h["reserve_mib"] != "auto":
+            return int(h["reserve_mib"])
+        if base is None:
+            base = self.vram_reserve if self.vram_reserve is not None else h["start_reserve_mib"]
+        return int(base) + VISION_HOT_ENCODER_MIB
+
+    def _engine_vram(self, reserve_mib, timeout: float, blocking: bool = True):
+        """engine.vram with the engine's control lines held in parallel mode (as POST /v1/vram takes them); the
+        caller holds self.fifo.  ModelBusy when a parallel slot keeps them."""
+        ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
+        if ctl is not None and not (ctl.acquire(timeout=timeout) if blocking else ctl.acquire(blocking=False)):
+            raise ModelBusy("a parallel request holds the engine")
+        try:
+            return self.engine.vram(reserve_mib, timeout=timeout)
+        finally:
+            if ctl is not None:
+                ctl.release()
+
+    def _vision_grow(self, blocking: bool = True) -> bool:
+        """Give the hot encoder's room back to the expert cache (the reserve in force: the last POST /v1/vram's, else
+        the start's).  The caller holds self.fifo.  False (logged; vision_shrunk stays set, the idle timer tries again)
+        when the engine refuses."""
+        if not self.vision_shrunk:
+            return True
+        if not self.loaded():
+            self.vision_shrunk = False                   # an engine that starts again starts full size
+            return True
+        try:
+            self._engine_vram(self.vram_reserve, self.vision_hot["shrink_timeout_s"], blocking)
+        except (ValueError, EngineDied, ModelBusy) as e:
+            self.vision_hot_stats["grow_failures"] += 1
+            print(f"[strata] vision hot: the expert cache did not grow back ({e}); trying again later", flush=True)
+            return False
+        self.vision_shrunk = False
+        return True
+
+    def _vision_fallback(self, why: str, t: dict):
+        """The GPU encoder could not come up (the cache is already grown back): the CPU encoder when configured,
+        else VisionUnavailable (a 503)."""
+        self.vision_hot_stats["failures"] += 1
+        if self.vision_cpu is None:
+            raise VisionUnavailable(f"the image encoder could not start ({why}); the expert cache was grown back, "
+                                    "text requests are not affected - try the image again")
+        print(f"[strata] vision hot: {why}; using the CPU encoder", flush=True)
+        t["fallback"] = "cpu"
+        self.vision_hot_stats["fallbacks"] += 1
+        if not self.vision_cpu.alive():
+            t1 = time.perf_counter()
+            try:
+                self.vision_cpu.restart()
+            except Exception as e:
+                raise VisionUnavailable(f"the image encoder could not start ({why}), nor the CPU encoder "
+                                        f"({e})") from None
+            t["start_ms"] += (time.perf_counter() - t1) * 1000
+        return self.vision_cpu
+
+    def _vision_hot_up(self, t: dict):
+        """Shrink the expert cache by the encoder's room, then start the GPU encoder.  The caller holds self.fifo.
+        -> the Vision to encode with (the CPU one after a failure, when configured)."""
+        h = self.vision_hot
+        if self.loaded():
+            reserve = self.hot_reserve_mib()
+            self.vision_shrunk = True                    # before the command: a partial shrink is grown back too
+            t0 = time.perf_counter()
+            try:
+                out = self._engine_vram(reserve, h["shrink_timeout_s"])
+            except (ValueError, EngineDied, ModelBusy) as e:
+                t["shrink_ms"] = (time.perf_counter() - t0) * 1000
+                self._vision_grow()
+                return self._vision_fallback(f"the expert cache did not shrink: {e}", t)
+            t["shrink_ms"] = (time.perf_counter() - t0) * 1000
+            t["free_before_start_mib"] = out.get("vram_free_mib") if isinstance(out, dict) else None
+        t1 = time.perf_counter()
+        try:
+            self.vision.restart()
+        except Exception as e:
+            t["start_ms"] = (time.perf_counter() - t1) * 1000
+            try:
+                self.vision.unload()
+            except Exception:
+                pass
+            self._vision_grow()
+            return self._vision_fallback(f"the GPU encoder did not start: {e}", t)
+        t["start_ms"] = (time.perf_counter() - t1) * 1000
+        t["free_after_start_mib"] = self.free_vram_mib()      # calibrates VISION_HOT_ENCODER_MIB (GPU window)
+        self.vision_hot_stats["cold_starts"] += 1
+        return self.vision
+
+    def encode_images(self, images) -> list:
+        """The request's images -> [(embeddings file, image tokens)].  The caller holds self.fifo.  Hot mode: an
+        image already encoded needs no encoder; otherwise the encoder is brought up first (shrink, start)."""
+        if not self.vision_hot:
+            return [self.vision.encode(src) for src in images]
+        t = {"shrink_ms": 0.0, "start_ms": 0.0, "encode_ms": 0.0, "cold": False, "fallback": None,
+             "images": len(images)}
+        found = [self.vision.cached(src) for src in images]
+        enc = self.vision
+        try:
+            if any(c is None for _, _, c in found):
+                if self.vision.alive():
+                    pass
+                elif self.vision_cpu is not None and self.vision_cpu.alive() and self.vision_shrunk is False:
+                    enc = self.vision_cpu                # the fallback is already up (the GPU one failed)
+                    t["fallback"] = "cpu"
+                else:
+                    t["cold"] = True
+                    enc = self._vision_hot_up(t)
+            t2 = time.perf_counter()
+            out = [c if c is not None else enc.encode(src, data=d) for src, (_, d, c) in zip(images, found)]
+            t["encode_ms"] = (time.perf_counter() - t2) * 1000
+        finally:
+            if self.vision_shrunk and not self.vision.alive():   # never a shrunk cache without its encoder
+                self._vision_grow()
+            st = self.vision_hot_stats
+            st["requests"] += 1
+            for k in ("shrink_ms", "start_ms", "encode_ms"):
+                st[k + "_total"] = round(st[k + "_total"] + t[k], 1)
+            st["last"] = {**{k: (round(x, 1) if isinstance(x, float) else x) for k, x in t.items()},
+                          "at": time.time()}
+            print(f"[strata] vision hot: shrink {t['shrink_ms']:.0f} ms, start {t['start_ms']:.0f} ms, "
+                  f"encode {t['encode_ms']:.0f} ms" + (" (CPU encoder)" if t["fallback"] else "") +
+                  ("" if t["cold"] or t["fallback"] else " (encoder warm)"), flush=True)
+        return out
+
+    def vision_idle_unload(self, idle_for: float) -> str:
+        """The hot encoder's idle timer: stop it and grow the expert cache back when no image request came for
+        idle_for seconds.  Same locking as unload(): never while a request runs or waits -> "unloaded", "busy",
+        "idle" (nothing to do)."""
+        if not self.fifo.acquire(blocking=False):
+            return "busy"
+        try:
+            with self.status_lock:
+                if self.status.get("busy") or self.status.get("queued"):
+                    return "busy"
+            if not self._hot_encoder_alive() and not self.vision_shrunk:
+                return "idle"
+            if time.time() - (self.last_image_at or self.started_at) < idle_for:
+                return "busy"
+            t0 = time.perf_counter()
+            for v in (self.vision, self.vision_cpu):
+                if v is not None and v.alive():
+                    v.unload()
+            t1 = time.perf_counter()
+            grown = self._vision_grow(blocking=False)
+            t2 = time.perf_counter()
+            self.vision_hot_stats["unloads"] += 1
+            self.vision_hot_stats["last_unload"] = {"stop_ms": round((t1 - t0) * 1000, 1),
+                                                    "grow_ms": round((t2 - t1) * 1000, 1), "grown": grown,
+                                                    "at": time.time()}
+            print(f"[strata] vision hot: encoder stopped after {idle_for:.0f} s without images (stop "
+                  f"{(t1 - t0) * 1000:.0f} ms, grow {(t2 - t1) * 1000:.0f} ms"
+                  f"{'' if grown else ', the cache did not grow back yet'})", flush=True)
+            return "unloaded"
+        finally:
+            self.fifo.release()
+
+    def start_vision_hot(self):
+        if not self.vision_hot:
+            return
+        idle = self.vision_hot["idle_unload_s"]
+        print(f"[strata] vision hot: the image encoder starts with the first image and stops after {idle:.0f} s "
+              f"without one (the expert cache keeps {self.hot_reserve_mib()} MiB free while it runs)", flush=True)
+
+        def loop():
+            while True:
+                time.sleep(max(0.5, min(15.0, idle / 4)))
+                try:
+                    self.vision_idle_unload(idle)
+                except Exception as e:                   # the thread keeps running; tried again at the next turn
+                    print(f"[strata] vision hot: idle unload: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
+
+    def vision_hot_view(self) -> dict | None:
+        """/metrics' "vision_hot": the state and the timings (per image request and cumulative)."""
+        if not self.vision_hot:
+            return None
+        return {"encoder_alive": bool(self.vision and self.vision.alive()),
+                "cpu_encoder_alive": bool(self.vision_cpu and self.vision_cpu.alive()),
+                "cache_shrunk": self.vision_shrunk, "reserve_mib": self.hot_reserve_mib(),
+                "idle_unload_s": self.vision_hot["idle_unload_s"], "last_image_at": self.last_image_at,
+                **{k: (dict(x) if isinstance(x, dict) else x) for k, x in self.vision_hot_stats.items()}}
 
     def _say_died(self, e: Exception) -> None:
         """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
@@ -2058,6 +2347,9 @@ class Service:
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
+            if self.vision_cpu is not None:
+                self.vision_cpu.unload()
+            self.vision_shrunk = False                   # the next engine starts with its cache full size
             print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
                   "the next request loads it again", flush=True)
             return "unloaded"
@@ -2238,6 +2530,7 @@ class Service:
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
+                "vision_hot": self.vision_hot_view(),
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
 
@@ -2332,8 +2625,9 @@ class Service:
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
+            self.last_image_at = time.time()       # hot encoder: its idle timer must not stop it from here on
             with self.fifo:
-                encoded = [self.vision.encode(src) for src in images]
+                encoded = self.encode_images(images)
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
@@ -4174,14 +4468,25 @@ def main() -> int:
         lazy = a.lazy or cfg.get("lazy_load") is True
         if lazy and cfg.get("vision"):
             ap.error("lazy loading is text-only; disable vision in the config")
+        try:
+            vision_hot = vision_hot_config(cfg)
+        except ValueError as e:
+            ap.error(f"config: {e}")
+        vision_cpu = None
         if cfg.get("vision"):
-            print("loading the vision encoder ...", flush=True)
+            # hot: not started here - the expert cache sizes itself without it, and the first image starts it
+            print("the vision encoder starts with the first image (vision hot)" if vision_hot else
+                  "loading the vision encoder ...", flush=True)
             # relative paths are the config's cwd's, as for the engine below
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
-            vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env))
+            vlog = open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None
+            vision = Vision(vcfg, log=vlog, env=vision_env(cfg, env), start=not vision_hot)
+            if vision_hot and vision_hot["cpu_fallback"] is not False:
+                cpu_env = dict(env, CUDA_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES="")   # no VRAM for the fallback
+                vision_cpu = Vision(vision_cpu_config(vcfg, vision_hot["cpu_fallback"]), log=vlog, env=cpu_env,
+                                    start=False)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
@@ -4210,6 +4515,7 @@ def main() -> int:
             print(note, flush=True)
     else:
         effort_end = None
+        vision_hot = vision_cpu = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
@@ -4218,6 +4524,13 @@ def main() -> int:
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    if vision is not None and vision_hot:
+        svc.vision_hot, svc.vision_cpu = vision_hot, vision_cpu
+        info = getattr(engine, "info", {}) or {}
+        if not lazy and str(info.get("vram_elastic", "1")) == "0":   # the engine turned --vram-elastic off
+            print("[strata] vision hot: the engine said --vram-elastic is off (see its log), so the expert cache "
+                  "cannot make room for the encoder: image requests will "
+                  + ("use the CPU encoder" if vision_cpu else "answer 503"), flush=True)
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:
@@ -4302,6 +4615,7 @@ def main() -> int:
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
+    svc.start_vision_hot()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
@@ -4340,6 +4654,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
         closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None,
+                   svc.vision_cpu.close if svc.vision_cpu else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:

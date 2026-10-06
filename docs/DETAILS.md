@@ -940,6 +940,21 @@ like `nvidia-smi`) to the `"vision"` section of `strata-<model>.json`: the encod
 `--vram-reserve-mib` in `"args"` to 700 as well, so the engine's cards keep that VRAM for the expert cache. The
 encoder's card needs code in the ready-made encoder (RTX 20/30/40/50).
 
+**The encoder only while pictures come (opt-in, "vision hot").** With `"vram_elastic": true` (one NVIDIA GPU, see
+"Giving part of the VRAM back" below) and `"hot": true` in the `"vision"` section, the encoder is not started with the
+server, so the expert cache gets its VRAM. A request with a picture that is not cached yet first shrinks the cache
+(`VRAM`, as `POST /v1/vram`) until the reserve in force plus ~1.4 GB is free (`"reserve_mib"`: `"auto"` or the MiB to
+keep free), then starts the encoder, then encodes; after `"idle_unload_s"` (120) without a picture the encoder stops
+and the cache grows back. Each picture request logs `[strata] vision hot: shrink X ms, start Y ms, encode Z ms`, and
+`/metrics` has a `"vision_hot"` block with the same timings. Every step runs between requests, under the same lock as
+the requests and the idle unload. When the shrink is refused or times out, or the encoder does not start, the cache is
+grown back and the request answers 503 - or uses a CPU encoder with `"cpu_fallback": true` (or a dict of vision keys
+for it). Keys: `"hot"`, `"idle_unload_s"`, `"reserve_mib"`, `"shrink_timeout_s"` (30), `"cpu_fallback"` (false).
+Resizing never touches the KV cache or the conversation cache: the `VRAM` command waits for the KV commit and a
+prompt's loan, and changes only the expert cache's slots and the prompt chunk size; growing back puts the same experts
+in the same slots, so answers after a shrink-and-grow cycle are token for token the ones before (#533's measurement).
+While the cache is shrunk, the experts it gave back are computed on the CPU, as any expert outside the cache is.
+
 ### Sending a picture
 
 **Terminal chat:** type `/image <path to a picture>`, press Enter, then type your question.
