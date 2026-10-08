@@ -29,6 +29,7 @@ fail = "--fail-window" in args
 groups = int(args[args.index("--says-groups") + 1]) if "--says-groups" in args else 0   # INFO batch_groups=G (--batch-groups auto)        # #997: the first window over two slots fails
 STEP = 0.02
 CH = 32
+DISK = " 0 0 0 0 0.0 0 0 1 100 3.0 200 4.0" if "--disk-metrics" in args else ""
 lines, stop = queue.Queue(), threading.Event()
 def reader():
     for l in sys.stdin:
@@ -127,7 +128,7 @@ while True:
             if log:
                 log.write(f"YIELD {given[0]} {given[1]}\n"); log.flush()
             print(f"YIELDED {given[0]} {given[1]}", flush=True)
-            print(f"DONE 0 {len(ids)} 5.0 0.0 cancel 0 0 {reused(ids)}", flush=True)
+            print(f"DONE 0 {len(ids)} 5.0 0.0 cancel 0 0 {reused(ids)}{DISK}", flush=True)
             if slot is not None:
                 print(f"BADM {slot} 0", flush=True)
             continue
@@ -140,7 +141,7 @@ while True:
             out += 1
             time.sleep(STEP)
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
-        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {reused(ids)}", flush=True)
+        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {reused(ids)}{DISK}", flush=True)
         if slot is not None:
             cont = fin == "length" and max_new > 1
             if cont:
@@ -246,7 +247,7 @@ class PickSlot(unittest.TestCase):
 class ParallelService(unittest.TestCase):
     """The real StrataEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False, says_groups=0, more=()):
+    def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False, says_groups=0, more=(), disk_metrics=False):
         import serve.server as server
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_strata.py"
@@ -259,6 +260,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--reuse"] if reuse else []
         extra += ["--says-groups", str(says_groups)] if says_groups else []
         extra += list(more)
+        extra += ["--disk-metrics"] if disk_metrics else []
         with mock.patch.object(server.subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = StrataEngine("strata", extra)
@@ -416,7 +418,7 @@ class ParallelService(unittest.TestCase):
     def test_a_long_prompt_gives_way_to_a_short_one(self):
         """#656: a long solo prompt read gives way at a chunk boundary; the short request is answered first, then the
         long one goes on (in the slot its part waited in) and is answered too."""
-        self.start(2)
+        self.start(2, disk_metrics=True)
         long_q, short_q = "long " * 600, "short"
         res = self.race(long_q, short_q)
         self.assertEqual(res[long_q][0], "ok, done.")
@@ -427,6 +429,14 @@ class ParallelService(unittest.TestCase):
         self.assertTrue(any(x.startswith("YIELD ") for x in log), log)
         with self.svc.status_lock:
             self.assertEqual(len(self.svc.history), 2)
+            row = max(self.svc.history, key=lambda r: r["prompt_total"])
+        segments = sum(x.split()[0] in ("GEN", "BGEN") and int(x.split()[2]) > 3000 for x in log)
+        self.assertGreater(segments, 1)
+        self.assertEqual(row["kv_persist_restored_tokens"], segments)
+        self.assertEqual(row["kv_persist_read_bytes"], 100 * segments)
+        self.assertEqual(row["kv_persist_write_bytes"], 200 * segments)
+        self.assertEqual(row["kv_persist_restore_ms"], 3.0 * segments)
+        self.assertEqual(row["kv_persist_commit_ms"], 4.0 * segments)
         self.assertFalse(any(self.engine.slot_busy))
 
     def test_three_requests_long_long_short_do_not_deadlock(self):

@@ -200,6 +200,38 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
     return true;
 }
 
+bool conversation_kv_spans(const QsaState& st, const ModelGeometry& g, int64_t upto,
+                          bool index, const std::string& prefix, int device,
+                          std::vector<PersistentGpuSpan>& spans, std::string& error) {
+    Layout l;
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    const auto addresses = pools(st);
+    const std::array<size_t,5> sizes = {l.data,l.value_data,l.scales,l.value_scales,l.pooled};
+    const std::string shape = prefix + "/format=" + std::to_string(l.format) + "/cells=" + std::to_string(l.cells)
+        + "/heads=" + std::to_string(g.n_head_kv) + "/dim=" + std::to_string(g.head_dim)
+        + "/page=" + std::to_string(l.page_size) + "/pooled=" + std::to_string(l.pooled_rows);
+    for(size_t i=0;i<sizes.size();++i) {
+        if(sizes[i] && !addresses[i]) {error="KV persistence: missing authoritative storage";return false;}
+        spans.push_back({{shape + "/" + std::to_string(i),sizes[i]},static_cast<uint8_t*>(addresses[i]),i!=4 && st.kv_mode!=0,device});
+    }
+    return true;
+}
+
+bool conversation_kv_residency_restore(const QsaState& st, const ModelGeometry& g,
+                                      int64_t upto, std::string& error) {
+    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+    if (st.kv_mode == 2 && upto > 0) {
+        auto shapes = strata::kernels::qsa_real_shapes();
+        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
+        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
+        strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
+                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
+    }
+    const auto status = cudaGetLastError();
+    if(status==cudaSuccess)return true;
+    error=std::string("KV persistence residency restore: ")+cudaGetErrorString(status);return false;
+}
+
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                              int64_t upto, bool index, std::string& error) {
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;

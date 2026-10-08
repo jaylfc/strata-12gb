@@ -6,8 +6,21 @@
 #include "strata/core/session.hpp"
 
 #include <string>
+#include "strata/core/kv_persistence.hpp"
 
 namespace strata::core {
+struct PersistentGpuSpan {
+    PersistentSection section;
+    uint8_t* address = nullptr;
+    bool host = false;
+    int device = 0;
+};
+// Direct authoritative storage spans: no full K/V image allocation.
+bool conversation_kv_spans(const QsaState& state, const ModelGeometry& g, int64_t upto,
+                          bool include_index, const std::string& prefix, int device,
+                          std::vector<PersistentGpuSpan>& spans, std::string& error);
+bool conversation_kv_residency_restore(const QsaState& state, const ModelGeometry& g,
+                                      int64_t upto, std::string& error);
 
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).

@@ -84,6 +84,17 @@ int main() {
     }
     const std::vector<int64_t> a = {1, 2, 3, 4}, b = {9, 8, 7, 6};
     {
+        const std::vector<ConversationImageKey> images = {{1,123},{4,456}};
+        check(conversation_image_prefix({{1,123}},4,images), "checkpoint excludes image at its boundary");
+        check(conversation_image_prefix(images,5,images), "full image metadata is a valid live prefix");
+        check(conversation_image_prefix({},1,images), "text before first image remains reusable");
+        check(!conversation_image_prefix({},4,images), "missing checkpoint image is rejected");
+        check(!conversation_image_prefix({{1,124}},4,images), "changed pixels or grid reject metadata prefix");
+        check(!conversation_image_prefix({{2,123}},4,images), "changed image position rejects metadata prefix");
+        check(!conversation_image_prefix(images,4,images), "extra checkpoint image is rejected");
+        check(!conversation_image_prefix({{1,123}},4,{}), "image checkpoint cannot validate against text live state");
+    }
+    {
         ConversationCache cache(1024, 2);
         check(cache.put(image({1, 2, 3})), "park A");
         check(cache.put(image({9, 8, 7})), "park B");
