@@ -11,6 +11,8 @@ It is opt-in and changes nothing when the options are absent (#465; the engine p
 
 ## Turning it on
 
+With [disk KV persistence](KV_PERSISTENCE.md) enabled, completed slots share the disk LRU and survive graceful engine restarts. The engine commits their state before slot overwrite or shutdown; pipelined groups commit before padding overwrites a completed row.
+
 One GPU: add `"parallel": 2` to the model's config (`strata-<model>.json`) and restart, or run setup with
 `--parallel 2`. Setup recommends it only where it does not cost speed (below); any number you ask for is kept as
 asked, with a note when it is more than setup would recommend.
